@@ -1,0 +1,1467 @@
+from dataset.data import Arbitrary_Sequence_Dataset
+
+# TODO: Automate loading of these imports
+# PRE-DEEPSPEED IMPORTS
+# from run.TrainingModule_predeepspeed import *
+# from model.model_predeepspeed import load_RMT, Mamba_LM_Tree_HeadModel, Mamba_LM_Tree_HeadModel_Old, StrippedMamba
+
+# DEEPSPEED IMPORTS
+# from run.TrainingModule import *
+# from model.model import load_RMT, Mamba_LM_Tree_HeadModel, Mamba_LM_Tree_HeadModel_Old, StrippedMamba, RankingHead, LMHead
+# from deepspeed.utils.zero_to_fp32 import convert_zero_checkpoint_to_fp32_state_dict
+
+# NEW CODE IMPORTS
+from run.TrainingModule import *
+from model.model import load_RMT, Mamba_LM_Tree_HeadModel, Mamba_LM_Tree_HeadModel_Old, StrippedMamba, RankingHead, LMHead
+
+from utils.constants import *
+from pytorch_lightning import LightningModule
+from collections import OrderedDict
+from skbio import DistanceMatrix
+from skbio.tree import nj
+from ete3 import Tree
+import os
+import torch
+from Bio import Phylo
+from Bio.Seq import Seq
+from Bio.SeqUtils import IUPACData
+from tqdm import tqdm
+import pickle
+from io import StringIO
+
+# TODO: Imports commented out below unnecessary for cleaned Phyla
+# import esm
+# from evo import Evo
+from eval.TreeCluster import TreeCluster
+from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPRegressor
+from statistics import mean
+from scipy.stats import spearmanr, pearsonr, kendalltau
+import time
+# import umap
+# import matplotlib.pyplot as plt
+import numpy as np
+from re import sub
+
+"""
+Run script with command: python3 -m eval.tree_builder configs/config_eval.yaml
+"""
+
+import pytorch_lightning as pl
+np.random.seed(0)
+torch.manual_seed(0)
+pl.seed_everything(42) 
+
+class TrainerConfig():
+    lr: float = 0.0001
+    record: bool = False
+    epochs: int = 6000
+    epochs_callback: int = 1000
+    steps_callback: int = 10000
+    #Number of sub trees per batch
+    batch_size: int = 2
+    #Number of sequences per sub tree
+    sub_tree_size: int = 10
+    save_path: str = 'defaultpath'
+    scheduler: str = 'defaultpath' # Change to 'cosine_annealing' for scheduler
+    model_type: str = 'MAMBA'
+    checkpoint_path: str = 'defaultpath'
+    checkpoint_id: int = 0  
+    ddp: bool = False
+    deepspeed: bool = False
+    num_annealing_steps: int = 10000
+    num_warmup_steps: int = 1000
+    use_tree_loss: bool = True
+    use_mlm_loss: bool = True
+    resume: bool = False
+    run_name: str = 'default_run'
+    symmetry_loss: int = 0
+
+class DatasetConfig():
+    dataset: str = 'zf10'
+    #Number of sub trees per batch
+    batch_size: int = 2
+    #Number of sequences per sub tree
+    sub_tree_size: int = 10
+    #Detect what gpu you are on, make tree/trees in range of 0 to largest sub-tree size for that gpu
+    adaptive_batch_size: bool = False
+
+class Mamba_ModelConfig():
+    d_model: int = 256
+    n_layer: int = 32 # Change based on number of layers in input
+    vocab_size: int = 24
+    ssm_cfg: dict = {}
+    rms_norm: bool = True
+    residual_in_fp32: bool = True
+    fused_add_norm: bool = True
+    pad_vocab_size_multiple: int = 8
+    num_blocks: int = 1 # Change based on number of layers in input
+    model_name: str = 'MAMBA'
+    calculation_method: str = "attention"
+    use_attention: bool = True
+    positional_embeddings: bool = False
+    inject_rotary_attention: bool = False
+    bidirectional_strategy: str = "add"
+    bidirectional_weight_tie: bool = True
+    bidirectional: bool = False
+    ranking_loss: bool = False
+
+class EvalConfig():
+    random: bool = False #Flag to randomly initialize model
+    convert_to_aa: bool = False
+    extra_name: str = ""
+    chunk: list = [] #A list where first entry is number of chunks and second is the specific chunk number to run
+
+class ESM2_ModelConfig():
+    model_name: str = "ESM2"
+
+class EVO_ModelConfig():
+    model_name: str = "EVO"
+
+class MSA_TRANSFORMER_ModelConfig():
+    model_name: str = "MSA-TRANSFORMER"
+
+class ESM3_ModelConfig():
+    model_name: str = "ESM3"
+
+class ESM2_3B_ModelConfig():
+    model_name: str = "ESM2_3B"
+
+class Config():
+    model: model = Mamba_ModelConfig()
+    dataset: dataset = DatasetConfig()
+    trainer: trainer = TrainerConfig()
+    eval: eval = EvalConfig()
+
+def load_model(checkpoint_file = None, config = None, random_model = False):
+
+    if config.model_name == "MAMBA":
+
+        # Load model architecture
+        if config.num_blocks == 1:
+            model = Mamba_LM_Tree_HeadModel_Old(config) # this is the original Mamba model
+        elif config.num_blocks > 1:
+            blocks = []
+            blocks.append(Mamba_LM_Tree_HeadModel(config, hidden_states=True, layer_idx = 0))
+            for i in range(config.num_blocks-2):
+                blocks.append(Mamba_LM_Tree_HeadModel(config, hidden_states=True, layer_idx= i+1))
+            blocks.append(Mamba_LM_Tree_HeadModel(config, layer_idx= i+1))
+            model = StrippedMamba(*blocks)
+
+            # TODO: Add in new ranking head 
+            if config.ranking_loss:
+                ranking_head =  RankingHead(config.d_model, 256)
+            else:
+                ranking_head = None
+
+        hparams = {'mode':'MAMBA', 'ranking_head': ranking_head}
+        model = TrainingModule(model, **hparams)
+
+        # Load non-deepspeed model
+        if not os.path.isdir(checkpoint_file):
+            checkpoint = torch.load(checkpoint_file)
+            state_dict = checkpoint["state_dict"]
+            model.load_state_dict(state_dict, strict=False)
+
+        # Load deepspeed model
+        else:
+            # Combine deepspeed checkpoint into state dict
+            # checkpoint_dir = "/".join(checkpoint_file.split("/")[:-1])
+
+            checkpoint_path = "%s_state_dict.pt" % checkpoint_file[:-5]
+            if not os.path.exists(checkpoint_path):
+                convert_zero_checkpoint_to_fp32_state_dict(checkpoint_file, checkpoint_path)
+            state_dict = torch.load(checkpoint_path)
+            # Remove "_forward_module" from saved weight names
+            state_dict = {k.replace('_forward_module.',''):v for k,v in state_dict.items()}
+            model.load_state_dict(state_dict, strict=True)
+
+    elif config.model_name == "ESM2":
+        model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+    
+    elif config.model_name == "EVO":
+        evo_model = Evo('evo-1-131k-base')
+        model, tokenizer = evo_model.model, evo_model.tokenizer
+
+    elif config.model_name == "MSA-TRANSFORMER":
+        model, alphabet = esm.pretrained.esm_msa1b_t12_100M_UR50S()
+
+    elif config.model_name == "ESM3":
+        model = ESM3.from_pretrained("esm3_sm_open_v1").to("cuda")
+        alphabet = None
+    
+    elif config.model_name == "ESM2_3B":
+        model, alphabet = esm.pretrained.esm2_t36_3B_UR50D()
+
+    model.eval()
+    if torch.cuda.is_available():
+        model = model.cuda()
+
+    if config.model_name == "MAMBA":
+        return {"model": model, "alphabet_tokenizer": None}
+    elif "ESM" in config.model_name:
+        return {"model": model, "alphabet": alphabet}
+    elif config.mdoel_name == "EVO":
+        return {"model": model, "tokenizer": tokenizer}
+    
+def generate_tree(seq_file, tree_file, model, alphabet_tokenizer, model_name, dataset_type, eval_mode, save = False, name = None, convert_to_aa = False, dictionary_data = None, random = False):
+    sequences = []
+    names = []
+    labels_binary = []
+    labels_cont = []
+    ref_tree_str = ""
+
+    # Read in datasets
+    if dataset_type in ["zf10", "20", "40"]:
+        for i in open(seq_file).readlines():
+            if i[0] == ">":
+                names.append(i.strip()[1:])
+            else:
+                sequences.append(i.strip())
+        f = open(tree_file, "r").read()
+        # Format for later RF calculation
+        ref_tree_str = "".join([val.split("_")[1] if len(val.split("_"))==2 else val for val in f.split("\n")])
+
+    elif dataset_type in ["protein_gym_sample"]:
+        seq_id_counter = 0
+        for i in open(seq_file).readlines():
+            data = i.split(',')
+            sequences.append(data[0].rstrip())
+            padding_zeros = (4 - len(str(seq_id_counter)))*"0"
+            names.append("seq%s%s" % (padding_zeros, seq_id_counter)) # Generate unique id for each sequence
+            labels_cont.append(float(data[1]))
+            labels_binary.append(int(data[2]))
+            seq_id_counter += 1
+        # Format for later RF calculation
+        f = open(tree_file, "r").read()
+        ref_tree_str = "".join([val.split("_")[1] if len(val.split("_"))==2 else val for val in f.split("\n")])
+    
+        # Generate fasta file for protein gym sample tree
+        # protein_gym_sample_str = ""
+        # for i in range(len(sequences)):
+        #     protein_gym_sample_str += ">%s\n%s\n" % (names[i], sequences[i])
+        # with open("eval/protein_gym_sample.fasta", "w") as f:
+        #     f.write(protein_gym_sample_str.strip())
+    
+    elif dataset_type in ["protein_gym1", "protein_gym2", "protein_gym"]:
+        seq_id_counter = 0
+        for i in open(seq_file).readlines():
+            # Skip header
+            if seq_id_counter == 0:
+                seq_id_counter += 1
+                continue
+            data = i.split(',')
+            sequences.append(data[1].rstrip())
+            padding_zeros = (4 - len(str(seq_id_counter)))*"0"
+            names.append("seq%s%s" % (padding_zeros, seq_id_counter)) # Generate unique id for each sequence
+            labels_cont.append(float(data[2]))
+            labels_binary.append(int(data[3]))
+            seq_id_counter += 1
+        # Format for later RF calculation
+        f = open(tree_file, "r").read()
+        ref_tree_str = "".join([val.split("_")[1] if len(val.split("_"))==2 else val for val in f.split("\n")])
+
+    elif dataset_type in ["openfold", "openfold_small", "openfold_3tree"]:
+
+        for i in open(seq_file).readlines():
+            if i[0] == ">":
+                names.append(i.strip()[1:])
+            else:
+                # Convert all lower case values to null values of "."
+                sequences.append(sub("[a-z]", '.', i.strip()))
+        f = open(tree_file, "r").read()
+        # Format for later RF calculation
+        ref_tree_str = "".join([val.split("_")[1] if len(val.split("_"))==2 else val for val in f.split("\n")])
+        labels_cont = torch.Tensor([])
+        labels_binary = torch.Tensor([])
+    
+    elif dataset_type in ["treebase"]:
+        nucleotide_letters = {"A", "C", "G", "T", "N"}
+        
+        for i in open(seq_file).readlines():
+            if i[0] == ">":
+                names.append(i.strip()[1:])
+            else:
+                # Convert all lower case values to null values of "."
+                curr_seq = sub("[a-z]", '.', i.strip())
+                # Check if the current sequence is a protein
+                non_nucleotide_count = sum(1 for char in curr_seq if char not in nucleotide_letters)
+                non_nucleotide_proportion = non_nucleotide_count / len(curr_seq)
+                # If current sequence not a protein, convert to amino acids
+                if non_nucleotide_proportion < 0.5:
+                    # Add trailing "N" characters to make the sequence length a multiple of 3
+                    remainder = len(curr_seq) % 3
+                    if remainder != 0:
+                        curr_seq += "N" * (3 - remainder)
+                    # Convert periods to amino acids
+                    curr_seq = curr_seq.replace(".", "N")
+                    curr_seq = curr_seq.replace("X", "N")
+                    # Convert to amino acids
+                    curr_seq = str(Seq(curr_seq).translate())
+                    # Manually remove all stop codons from the sequence, as this is outside the vocabulary of PLMs
+                    curr_seq = curr_seq.replace("*", "")
+
+                sequences.append(curr_seq)
+                
+        f = open(tree_file, "r").read()
+        # Format for later RF calculation
+        ref_tree_str = "".join([val.split("_")[1] if len(val.split("_"))==2 else val for val in f.split("\n")])
+        labels_cont = torch.Tensor([])
+        labels_binary = torch.Tensor([])
+
+    elif dictionary_data is not None and dataset_type == "treefam":
+
+        for i in dictionary_data["sequences"]:
+            names.append(i)
+            sequences.append(dictionary_data["sequences"][i].replace('-', ''))
+        
+        ref_tree_str = dictionary_data["tree_newick"]
+
+        tree_data = ref_tree_str.split('\n')
+        name_mapping = {}
+        to_replace = []
+        for item in tree_data:
+            collected = item.split(' ')
+            if collected[0] == 'SEQ':
+                if ':' in collected[2]:
+                    replacemante = [collected[2]]
+                    collected[2] = collected[2].replace(':', '-')
+                    replacemante.append(collected[2])
+                    to_replace.append(replacemante)
+
+                #name_mapping[collected[2]] = f'{collected[1]}|{collected[2]}'
+                name_mapping[collected[2]] = f'{collected[2]}'
+            elif item[0] == '(':
+                ref_tree_str = item
+
+        for i, z in to_replace:
+            ref_tree_str = ref_tree_str.replace(i, z)
+        
+        revised_names = []
+        for i in names:
+            revised_names.append(i.replace(':', '-'))
+        names = revised_names
+
+        tree = Phylo.read(StringIO(ref_tree_str), "newick")
+
+        # Relabel tips
+        for leaf in tree.get_terminals():
+            if leaf.name in name_mapping:
+                leaf.name = name_mapping[leaf.name]
+            else:
+                raise Exception("NAME MAPPING FAILED IN TREEFAM ")
+        
+        ref_tree_str = tree.format("newick")
+    
+    elif dataset_type in ["swisstree"]:
+        swisstree_dataset_path = "/n/holystore01/LABS/mzitnik_lab/Lab/ashen/swisstree/"
+
+        # Extract each sequence from the 651 separate fasta files
+        for file_path in os.listdir(swisstree_dataset_path):
+            curr_file_path = f"{swisstree_dataset_path}{file_path}"
+
+            # Extract name and sequence
+            file_readlines = [line.strip() for line in open(curr_file_path).readlines()]
+            curr_name = file_readlines[0][1:]
+            curr_seq = "".join(file_readlines[1:]).upper()
+            names.append(curr_name)
+            sequences.append(curr_seq)
+
+        labels_cont = torch.Tensor([])
+        labels_binary = torch.Tensor([])
+
+    # TODO: Move this to the "MAMBA" section after changing Evo's pipeline to work with built-in tokenizer
+    # TODO: May need to regenerate runtime results with this change
+    # print("Data gathered")
+    dataset = Arbitrary_Sequence_Dataset()
+    # batch = dataset.encode_sequences(sequences)
+    batch, names = dataset.encode_sequences(sequences, names)
+
+    # For finding max batch size for ESM2 and EVO
+    # max_aa_dict = {"ESM2": 19024, "EVO": 7138}   # Derived empirically, old max batch size with tracking gradients
+    # max_aa_dict = {"ESM2": 706624, "EVO": 173000} # Derived empirically
+    max_aa_dict = {"ESM2": 19532, "EVO": 62500} # Derived from papers
+    # summary_file = [dataset.strip().split(",") for dataset in open("%s/eval/proteingym_summary.csv" % curr_dir).readlines()]
+    # seq_length_dict = {}   # key: dataset_name, value: seq_length
+    # for dataset in summary_file[1:]:
+    #     seq_length_dict[dataset[0]] = int(dataset[3])
+    # dataset_name = seq_file.split("/")[-1][:-4]
+
+    if "MAMBA" in model_name:
+
+        # Original method without chunking
+        # with torch.no_grad():
+        #         sequence_embeddings = model.get_sequence_embeddings(batch['encoded_sequences'].cuda(),
+        #                                                             batch['cls_positions'].cuda(), 
+        #                                                             batch['sequence_mask'].cuda())
+        # TODO: Added in to deal with canUse32BitIndexMath error
+        try:
+            with torch.no_grad():
+                sequence_embeddings = model.get_sequence_embeddings(batch['encoded_sequences'].cuda(),
+                                                                    batch['cls_positions'].cuda(), 
+                                                                    batch['sequence_mask'].cuda())
+        except:
+            print("Errors out with canUse32BitIndexMath so skipping sample")
+            # with torch.no_grad():
+            #     model = model.cpu()
+            #     import pdb; pdb.set_trace()
+            #     sequence_embeddings = model.get_sequence_embeddings(batch['encoded_sequences'],
+            #                                                         batch['cls_positions'], 
+            #                                                         batch['sequence_mask'])
+            #     sequence_embeddings = sequence_embeddings.cuda()
+            #     model = model.cuda()
+            #     import pdb; pdb.set_trace()
+
+            return {"pred_tree": None,
+            "pred_tree_str": None,
+            "ref_tree_str": None,
+            "pdm": None,
+            "max_dist": None,
+            "labels_cont": None,
+            "labels_binary": None,
+            "names": None,
+            "corr_coeff_dict": None}
+
+    elif model_name == "ESM2" or model_name == "ESM2_3B":
+
+        # Tokenize sequences for input to ESM2
+        batch_converter = alphabet.get_batch_converter()
+        data = [(names[i], sequences[i]) for i in range(len(names))]
+        batch_labels, batch_strs, batch_tokens = batch_converter(data)
+        batch_lens = (batch_tokens != alphabet.padding_idx).sum(1)
+
+        # Generate token representations in batched sequence format
+        token_representations = torch.Tensor([])
+        num_seqs = len(batch_lens)
+        seq_length = batch_tokens.shape[1]
+        seqs_per_chunk = (max_aa_dict["ESM2"] // seq_length)
+        token_representations = torch.Tensor([])
+        for i in range(0, len(batch_tokens), seqs_per_chunk):
+            with torch.no_grad():
+                results = model(batch_tokens[i:i+seqs_per_chunk].cuda(), repr_layers=[33], return_contacts=False)
+            token_representations = torch.cat((token_representations, results["representations"][33].detach().cpu()))
+
+        # Generate sequence embeddings
+        sequence_embeddings = []
+        for i, tokens_len in enumerate(batch_lens):
+            sequence_embeddings.append(token_representations[i, 1 : tokens_len - 1].mean(0))
+        sequence_embeddings = torch.stack(sequence_embeddings).unsqueeze(0)
+
+        # Generate token representations with batched sequence format
+        # num_seqs = batch["sequence_lengths"].shape[1]
+        # seq_length = batch["sequence_lengths"][0][0]
+        # batch["encoded_sequences"] = batch["encoded_sequences"].squeeze().view((num_seqs,seq_length))
+        # seqs_per_chunk = (max_aa_dict["ESM2"] // seq_length_dict[dataset_name])
+        # token_representations = torch.Tensor([])
+        # for i in range(0, batch["encoded_sequences"].shape[0], seqs_per_chunk):
+        #     with torch.no_grad():
+        #         results = model(batch["encoded_sequences"][i:i+seqs_per_chunk].cuda(), repr_layers=[33], return_contacts=False)
+        #     token_representations = torch.cat((token_representations, results["representations"][33].detach().cpu()))
+        # sequence_embeddings = token_representations.mean(1).unsqueeze(0)
+
+    elif model_name == "EVO":
+        # TODO: Convert to the recommended EVO pipeline for generating embeddings
+        import pdb; pdb.set_trace()
+
+        # Generate token representations with batched sequence format
+        num_seqs = batch["sequence_lengths"].shape[1]
+        seq_length = batch["sequence_lengths"][0][0]
+        batch["encoded_sequences"] = batch["encoded_sequences"].squeeze().view((num_seqs,seq_length))
+        seqs_per_chunk = (max_aa_dict["EVO"] // seq_length_dict[dataset_name])
+        logits = torch.Tensor([])
+        for i in range(0, batch["encoded_sequences"].shape[0], seqs_per_chunk):
+            with torch.no_grad():
+                results = model(batch["encoded_sequences"][i:i+seqs_per_chunk].cuda())[0]
+            logits = torch.cat((logits, results.detach().cpu()))
+        sequence_embeddings = logits.mean(1).unsqueeze(0)
+    
+    elif model_name == "MSA-TRANSFORMER":
+        import pdb; pdb.set_trace()
+        pass
+    
+    elif model_name == "ESM3":
+        
+        # Calculate sequence embeddings 
+        sequence_embeddings = []
+        for sequence in sequences:
+            protein = ESMProtein(sequence=sequence)
+            protein_tensor = model.encode(protein) 
+            output = model.forward_and_sample(protein_tensor, SamplingConfig(return_per_residue_embeddings=True))
+            token_embeddings = output.per_residue_embedding
+            sequence_embeddings.append(token_embeddings.mean(0).unsqueeze(0))
+        sequence_embeddings = torch.cat(sequence_embeddings).unsqueeze(0)
+    
+    # elif model_name == "ESM2_3B":
+
+        # Generate token representations with batched sequence format
+        # num_seqs = batch["sequence_lengths"].shape[1]
+        # seq_length = batch["sequence_lengths"][0][0]
+        # batch["encoded_sequences"] = batch["encoded_sequences"].squeeze().view((num_seqs,seq_length))
+        # seqs_per_chunk = (max_aa_dict["ESM2"] // seq_length_dict[dataset_name])
+        # token_representations = torch.Tensor([])
+        # for i in range(0, batch["encoded_sequences"].shape[0], seqs_per_chunk):
+        #     with torch.no_grad():
+        #         results = model(batch["encoded_sequences"][i:i+seqs_per_chunk].cuda(), repr_layers=[33], return_contacts=False)
+        #     token_representations = torch.cat((token_representations, results["representations"][33].detach().cpu()))
+        # sequence_embeddings = token_representations.mean(1).unsqueeze(0)
+
+    # Calculate linear probe value if evaluting Tier 2
+    if dataset_type in ["protein_gym1", "protein_gym2", "protein_gym"]:
+        # Train linear probe on output embeddings
+        # TODO: Temp comment out MLPRegressor to calculate just Tier 2
+        just_tier2 = True
+        if just_tier2:
+            corr_coeff_dict = {"spearman": 0,
+                                "pearson": 0,
+                                "kendall": 0}
+        else:
+            linear_probe = MLPRegressor(random_state=1, max_iter=500).fit(sequence_embeddings.detach().cpu().squeeze(), torch.Tensor(labels_cont))
+            # linear_probe = MLPRegressor(random_state=1, max_iter=1000).fit(sequence_embeddings.detach().cpu().squeeze(), torch.Tensor(labels_cont))
+            # Split data into training and validation sets
+            # X_train, X_val, y_train, y_val = train_test_split(
+            #     sequence_embeddings.detach().cpu().squeeze(), 
+            #     torch.Tensor(labels_cont), 
+            #     test_size=0.2, 
+            #     random_state=42
+            # )
+            # # Train MLPRegressor with early stopping
+            # linear_probe = MLPRegressor(
+            #     random_state=1, 
+            #     max_iter=1000,  # Maximum number of iterations
+            #     early_stopping=True,  # Enable early stopping
+            #     validation_fraction=0.2,  # Fraction of training data to use as validation
+            #     n_iter_no_change=10  # Stop if no improvement for 10 iterations
+            # ).fit(X_train, y_train)
+
+            preds = linear_probe.predict(sequence_embeddings.detach().cpu().squeeze())
+
+            # Calculate correlation coefficients
+            spearman_res = spearmanr(torch.Tensor(labels_cont), torch.Tensor(preds))
+            pearson_res = pearsonr(torch.Tensor(labels_cont), torch.Tensor(preds))
+            kendall_res = kendalltau(torch.Tensor(labels_cont), torch.Tensor(preds))
+            corr_coeff_dict = {"spearman": spearman_res.statistic,
+                            "pearson": pearson_res.statistic,
+                            "kendall": kendall_res.statistic}
+        
+        # # TODO: New code for zero shot calculation
+        # embeds = sequence_embeddings.detach().cpu().squeeze()
+        # # Use Euclidean distance
+        # embedding_dists = torch.Tensor([np.linalg.norm(embeds[0]-embeds[i]) for i in range(1,len(embeds))])
+        # zeroshot_euclidean_spearman_res = spearmanr(embedding_dists, torch.Tensor(labels_cont)[1:])
+        # # Use cosim distance
+        # cos = nn.CosineSimilarity(dim=0)
+        # embedding_dists = torch.Tensor([cos(embeds[0],embeds[i]) for i in range(1,len(embeds))])
+        # zeroshot_cosim_spearman_res = spearmanr(embedding_dists, torch.Tensor(labels_cont)[1:])
+        # # Use log softmax scaled values with Euclidean
+        # probs = torch.log_softmax(sequence_embeddings, dim=-1).detach().cpu().squeeze()
+        # embedding_dists_logsoftmax = torch.Tensor([np.linalg.norm(probs[0]-probs[i]) for i in range(1,len(probs))])
+        # zeroshot_euclidean_logsoftmax_spearman_res = spearmanr(embedding_dists_logsoftmax, torch.Tensor(labels_cont)[1:])
+        # # Use log softmax scaled values with cosim distance
+        # cos = nn.CosineSimilarity(dim=0)
+        # embedding_dists_logsoftmax = torch.Tensor([cos(probs[0],probs[i]) for i in range(1,len(probs))])
+        # zeroshot_cosim_logsoftmax_spearman_res = spearmanr(embedding_dists_logsoftmax, torch.Tensor(labels_cont)[1:])
+        # print("Euclidean: %s, Cosim: %s, Euclidean Log Softmax: %s, Cosim Log Softmax: %s\n" % (zeroshot_euclidean_spearman_res.statistic, 
+        #                                                                                         zeroshot_cosim_spearman_res.statistic,
+        #                                                                                         zeroshot_euclidean_logsoftmax_spearman_res.statistic,
+        #                                                                                         zeroshot_cosim_logsoftmax_spearman_res.statistic))
+                                                                                                
+    elif dataset_type in ["openfold", "openfold_small", "openfold_3tree", "swisstree", "treebase", "treefam"]:
+        corr_coeff_dict = {}
+
+    # PLot and save UMAP of embeddings
+    if eval_mode:
+        proteingym_dataset_name = seq_file.split("/")[-1]
+        reducer = umap.UMAP(n_jobs=1, random_state=42)
+        umap_out = reducer.fit_transform(sequence_embeddings.squeeze().detach().cpu())
+        plt.scatter(umap_out[:,0], umap_out[:,1])
+        plt.title("%s %s UMAP" % (proteingym_dataset_name, model_name))
+        plt.savefig("eval/figures/%s_%s_umap.png" % (proteingym_dataset_name, model_name))
+        plt.clf()
+        return
+
+    pred_matrix = torch.cdist(sequence_embeddings, sequence_embeddings, compute_mode='donot_use_mm_for_euclid_dist')
+    pred_tree, dm, pred_tree_str = reconstruct_tree(pred_matrix.cpu().detach().numpy()[0], names)
+    if save:
+        open(f'{name}.nwk', 'w').write(tree_str)
+        x = open(f'{name}_labels', 'w')
+        for i in open(seq_file).readlines():
+            data = i.split(',')
+            x.write(f'{data[1]}\t{data[2].rstrip()}\n')
+            # names.append(data[1].rstrip())
+            # sequences.append(data[0])
+
+    # Calculate pairwise distance matrix (for Tier 2 task) 
+    pairwise_distances = {}
+    max_dist = 0 # Used for threshold value in clustering
+    for i in range(len(dm.ids)):
+        if dm.ids[i] not in pairwise_distances:
+            pairwise_distances[dm.ids[i]] = {}
+        for j in range(len(dm.ids)):
+            # Update maximum distance
+            if dm[i,j] > max_dist:
+                    max_dist = dm[i,j]
+            if dm.ids[j] not in pairwise_distances[dm.ids[i]]:
+                pairwise_distances[dm.ids[i]][dm.ids[j]] = [dm[i,j]]
+            else:
+                pairwise_distances[dm.ids[i]][dm.ids[j]].append(dm[i,j])
+    return {"pred_tree": pred_tree,
+            "pred_tree_str": pred_tree_str,
+            "ref_tree_str": ref_tree_str,
+            "pdm": pairwise_distances,
+            "max_dist": max_dist,
+            "labels_cont": labels_cont,
+            "labels_binary": labels_binary,
+            "names": names,
+            "corr_coeff_dict": corr_coeff_dict}
+
+def reconstruct_tree(matrix, ids):
+    """
+    Creates tree from pairwise distance matrix
+    Input: (list of [float]) pairwise distance matrix
+           (list of str) ids for the matrix
+    Output: () reconstructed tree
+
+    From scikit-bio docs: https://scikit.bio/docs/latest/generated/skbio.tree.nj.html#skbio.tree.nj
+    """
+
+    # Reconstruct tree using scikit bio
+    dm = DistanceMatrix(matrix, ids)
+    tree = nj(dm)
+    # tree_str = nj(dm, result_constructor=str)
+    tree_str = tree.__str__()
+
+    return tree, dm, tree_str.replace(" ", "")
+
+def rf_distance(tree1_str, tree2_str):
+    """
+    Calculates Robinson-Foulds distance between two trees
+    Input: (str) Newick string of tree 1
+           (str) Newick string of tree 2
+    Output: (int) output Robinson-Foulds distance
+    """
+
+    try:
+    
+        # Remove branch distances from the Newick strings of the predicted and reference tree
+        def remove_branch_distances(tree_str):
+
+            # Set branch lengths in tree to zero
+            phylo_tree = Phylo.read(StringIO(tree_str), "newick")
+            for i in phylo_tree.get_nonterminals():
+                i.branch_length=None
+            for i in phylo_tree.get_terminals():
+                i.branch_length=None
+
+            # Convert edited tree to Newick string
+            new_str_obj = StringIO()
+            Phylo.write(phylo_tree, new_str_obj, "newick")
+            new_str_obj.seek(0)
+            new_str = new_str_obj.getvalue()
+
+            # Remove distances from edited tree string
+            dist_decimals = 8   # To remove the distance value of ":0.00000"
+            while True:
+                try:
+                    curr_index = new_str.index(":")
+                    new_str = new_str[:curr_index] + new_str[curr_index+dist_decimals:]
+                except:
+                    return new_str
+
+        tree1_str_nodist = remove_branch_distances(tree1_str)
+        tree2_str_nodist = remove_branch_distances(tree2_str)
+
+        # Calculate tree comparison metrics
+        t1 = Tree(tree1_str_nodist)
+        t2 = Tree(tree2_str_nodist)
+        result = t1.compare(t2, unrooted=True)
+        rf = int(result["rf"])
+        max_rf = int(result["max_rf"])
+        norm_rf = result["norm_rf"]
+
+    except:
+        print("Tree formats are invalid, skipping this sample")
+        return {"rf": None,
+            "max_rf": None,
+            "norm_rf": None}
+
+    return {"rf": rf,
+            "max_rf": max_rf,
+            "norm_rf": norm_rf}
+
+def mean_cluster_value(names, clusters, labels_cont, labels_binary):
+
+    # Create lookup table for sample labels
+    label_dict = {}
+    train_labels_cont = []
+    for i in range(len(names)):
+        label_dict[names[i]] = [labels_cont[i], labels_binary[i]]
+
+    # Create lookup table for sample clusters
+    cluster_id = 1
+    cluster_dict = {}
+    for cluster in clusters:
+        if len(cluster) > 1:
+            for sample in cluster:
+                cluster_dict[sample] = cluster_id
+            cluster_id += 1
+        else:
+            cluster_dict[cluster[0]] = -1
+
+    # Split samples into train/test sets
+    names_train, names_test = train_test_split(names, test_size=0.2, random_state=42)
+    
+    # Save train labels for baseline if test sample is in singleton cluster
+    for name in names_train:
+        train_labels_cont.append(label_dict[name][0])
+
+    # Calculate predicted value for each test sample
+    labels_cont_test = {}
+    preds_cont_test = {}
+    # Extract continuous labels for test set
+    for name in names_test:
+        labels_cont_test[name] = label_dict[name][0]
+    # Calculate continuous predictions for test set
+    for cluster in clusters:
+        cluster_label_list = []
+        curr_test_names = []
+        for name in cluster:
+            # Only use train samples for estimate
+            if name in names_train:
+                cluster_label_list.append(label_dict[name][0])
+            elif name in names_test:
+                curr_test_names.append(name)
+        # Calculate predicted label for test samples 
+        if len(cluster_label_list) > 0:
+            avg_label = mean(cluster_label_list)
+        else: 
+            # TODO: If test sample is in singleton cluster, set to average value of training samples in tree
+            avg_label = mean(train_labels_cont)
+        for name in curr_test_names:
+            preds_cont_test[name] = avg_label
+
+    # Calculate spearman rank between labels and preds
+    # Sort keys
+    sorted_names = sorted(labels_cont_test.keys())
+    labels = []
+    preds = []
+    for name in sorted_names:
+        labels.append(labels_cont_test[name])
+        preds.append(preds_cont_test[name])
+    # Calculate correlation coefficients
+    spearman_res = spearmanr(labels, preds)
+    pearson_res = pearsonr(labels, preds)
+    kendall_res = kendalltau(labels, preds)
+
+    return {"spearman": spearman_res.statistic,
+            "pearson": pearson_res.statistic,
+            "kendall": kendall_res.statistic}
+
+# Tier 1 metric
+def tier1_metric(tree_dicts):
+
+    # Generate Tier 1 evaluation metric for RF distance
+    # print("Model: RF Distance")
+    tier1_results = {}
+    for model_name in tree_dicts.keys():
+        curr_tree_dict = tree_dicts[model_name]
+        ref_tree_str = curr_tree_dict["ref_tree_str"]
+        pred_tree_str = curr_tree_dict["pred_tree_str"]
+        # print("%s: %s" % (model_name, rf_distance(ref_tree_str, pred_tree_str)))
+        tier1_results[model_name] = rf_distance(ref_tree_str, pred_tree_str)
+    return tier1_results
+
+# Tier 2 metric
+def tier2_metric(tree_dicts):
+
+    # Generate Tier 2 evaluation metric for average train label value within cluster
+    # print("Model: Spearman Rank of Labels vs Preds")
+    tier2_results = {}
+    for model_name in tree_dicts.keys():
+        pred_tree_str = tree_dicts[model_name]["pred_tree_str"]
+        names = tree_dicts[model_name]["names"]
+        labels_cont = tree_dicts[model_name]["labels_cont"]
+        labels_binary = tree_dicts[model_name]["labels_binary"]
+        threshold = tree_dicts[model_name]["max_dist"]
+        clusters = TreeCluster.run_treecluster(tree_str=pred_tree_str, threshold=threshold)
+        # print("%s: %s" % (model_name, mean_cluster_value(names, clusters, labels_cont, labels_binary)))
+        tier2_results[model_name] = mean_cluster_value(names, clusters, labels_cont, labels_binary)
+    return tier2_results
+
+def generate_clustering_GTB_results(models, output_file_name, output_file_location, eval_datasets):
+    max_aa_dict = {"ESM2": 19532, "EVO": 62500}
+
+    for taxonomy in eval_datasets:
+        print(f"Starting this taxonomy: {taxonomy} analysis")
+        sequence = eval_datasets[taxonomy]["sequences"]
+        labels = eval_datasets[taxonomy]["labels"]
+
+        for model_name in models.keys():
+            labels = pd.read_csv(labels, sep='\t')
+
+            if os.path.exists(output_file_location+f'{model_name}_{taxonomy}_sequence_embeddings.pkl'):
+                print(f"loading premade embeddings for {model_name} on {sequence}")
+                isolate_sequence_embeddings = pickle.load(open(output_file_location+f'{model_name}_{taxonomy}_sequence_embeddings.pkl', 'rb'))
+            else:
+                isolate_sequence_embeddings = {}
+
+                isolate_sequences = pickle.load(open(sequence, "rb"))
+                
+                if "MAMBA" in model_name:
+                    """
+                    # Original method without chunking
+                    with torch.no_grad():
+                        sequence_embeddings = model.get_sequence_embeddings(batch['encoded_sequences'].cuda(),
+                                                                            batch['cls_positions'].cuda(), 
+                                                                            batch['sequence_mask'].cuda())
+                    """
+                    raise Exception("MAMBA model not implemented yet")
+                else:
+                    for isolate in tqdm(isolate_sequences, total = len(isolate_sequences)):
+                        sequences = [i.replace('-', '') for i in isolate_sequences[isolate]]
+                        model, alphabet_tokenizer = models[model_name]["model"], models[model_name]["alphabet_tokenizer"]
+
+                        if model_name == "ESM2" or model_name == "ESM2_3B":
+
+                            # Tokenize sequences for input to ESM2
+                            batch_converter = alphabet_tokenizer.get_batch_converter()
+                            data = [(i, sequences[i]) for i in range(len(sequences))]
+                            batch_labels, batch_strs, batch_tokens = batch_converter(data)
+                            batch_lens = (batch_tokens != alphabet_tokenizer.padding_idx).sum(1)
+
+                            # Generate token representations in batched sequence format
+                            token_representations = torch.Tensor([])
+                            num_seqs = len(batch_lens)
+                            seq_length = batch_tokens.shape[1]
+                            seqs_per_chunk = (max_aa_dict["ESM2"] // seq_length)
+                            token_representations = torch.Tensor([])
+                            for i in range(0, len(batch_tokens), seqs_per_chunk):
+                                with torch.no_grad():
+                                    results = model(batch_tokens[i:i+seqs_per_chunk].cuda(), repr_layers=[33], return_contacts=False)
+                                token_representations = torch.cat((token_representations, results["representations"][33].detach().cpu()))
+
+                            # Generate sequence embeddings
+                            sequence_embeddings = []
+                            for i, tokens_len in enumerate(batch_lens):
+                                sequence_embeddings.append(token_representations[i, 1 : tokens_len - 1].mean(0))
+                            sequence_embeddings = torch.stack(sequence_embeddings).unsqueeze(0)
+
+                        elif model_name == "EVO":
+                            # Convert to the recommended EVO pipeline for generating embeddings
+                            # Convert all protein sequences into nucleotide sequences
+                            # Remove all periods
+                            sequences = [seq.replace(".", "L") for seq in sequences]
+                            sequences = [reverse_translate(seq) for seq in sequences]
+                            # Generate sequence embeddings in batches
+                            logits = torch.Tensor([])
+                            num_seqs = len(sequences)
+
+                            # For manual padding to deal with different max sizes in sub-batches
+                            max_seq_length = max([len(seq) for seq in sequences])
+                            seqs_per_chunk = (max_aa_dict["EVO"] // max_seq_length)
+                            device = 'cuda:0'
+                            for i in range(0, num_seqs, seqs_per_chunk):
+                                with torch.no_grad():
+                                    input_ids, seq_lengths = prepare_batch(sequences[i:i+seqs_per_chunk], alphabet_tokenizer, prepend_bos=False, device=device)
+                                    # Manually pad
+                                    curr_num_to_pad = max_seq_length - input_ids.shape[1]
+                                    input_ids = torch.cat((input_ids, torch.ones(input_ids.shape[0], curr_num_to_pad, dtype=torch.int64).cuda()),dim=1)
+                                    # input_ids = torch.cat((input_ids, torch.ones(input_ids.shape[0], curr_num_to_pad, dtype=torch.int64, device=device)),dim=1)
+                                    results, _ = model(input_ids)
+                                # TODO: Logits might not be correct, may need embeddings
+                                logits = torch.cat((logits, results.detach().cpu()))
+                            sequence_embeddings = logits.mean(1).unsqueeze(0)
+                        
+                        elif model_name == "ESM3":
+                            
+                            # Calculate sequence embeddings 
+                            sequence_embeddings = []
+                            for sequence in sequences:
+                                protein = ESMProtein(sequence=sequence)
+                                protein_tensor = model.encode(protein) 
+                                output = model.forward_and_sample(protein_tensor, SamplingConfig(return_per_residue_embeddings=True))
+                                token_embeddings = output.per_residue_embedding
+                                sequence_embeddings.append(token_embeddings.mean(0).unsqueeze(0))
+                            sequence_embeddings = torch.cat(sequence_embeddings).unsqueeze(0)
+
+                        elif model_name in ["ESMC_300M", "ESMC_600M"]:
+
+                            # Calculate sequence embeddings 
+                            max_seq_length = max([len(seq) for seq in sequences]) + 2 # Adding +2 because of the built-in ESMC tokenization strategy
+                            sequence_embeddings = []
+                            for sequence in sequences:
+                                protein = ESMProtein(sequence=sequence)
+                                protein_tensor = model.encode(protein)
+
+                                # Manually pad
+                                curr_num_to_pad = max_seq_length - len(protein_tensor)
+                                protein_tensor.sequence = torch.cat((protein_tensor.sequence, torch.ones(curr_num_to_pad, dtype=torch.int64).cuda()))
+
+                                logits_output = model.logits(protein_tensor, LogitsConfig(sequence=True, return_embeddings=True))
+                                sequence_embeddings.append((logits_output.embeddings).squeeze().mean(0).unsqueeze(0))
+                            sequence_embeddings = torch.cat(sequence_embeddings).unsqueeze(0)
+                        
+                        elif model_name == "EVO2":
+                            
+                            sequence_embeddings = []
+                            for sequence in sequences:
+                                input_ids = torch.tensor(alphabet_tokenizer.tokenize(sequence), dtype=torch.int).unsqueeze(0).to('cuda:0')
+                                layer_name = 'blocks.28.mlp.l3'
+                                outputs, embeddings = model(input_ids, return_embeddings=True, layer_names=[layer_name])
+                                sequence_embeddings.append(embeddings[layer_name].squeeze().mean(0).unsqueeze(0))
+                            sequence_embeddings = torch.cat(sequence_embeddings).unsqueeze(0)
+                            sequence_embeddings = sequence_embeddings.to(torch.float64)
+                        
+                        isolate_sequence_embeddings[isolate] = sequence_embeddings
+                    
+                pickle.dump(isolate_sequence_embeddings, open(output_file_location+f'{model_name}_{taxonomy}_sequence_embeddings.pkl', 'wb'))
+        
+        averaged_isolate_sequence_embeddings = {}
+        for isolate in isolate_sequence_embeddings:
+            averaged_isolate_sequence_embeddings[isolate] = torch.nan_to_num(isolate_sequence_embeddings[isolate], nan=0.0).mean(axis=1)
+
+        id_to_label = labels[['genome_id',taxonomy]]
+
+        # Prepare the data
+        embeddings = []
+        labels = []
+
+        # Extract embeddings and labels
+        for isolate, embedding in averaged_isolate_sequence_embeddings.items():
+            embeddings.append(embedding.cpu().numpy())  # Convert to NumPy array
+            taxonomic_label = id_to_label[id_to_label['genome_id'] == isolate][taxonomy].values[0]
+            labels.append(taxonomic_label)
+
+        # Convert to NumPy arrays
+        embeddings = np.vstack(embeddings)  # Shape: (num_samples, embedding_dim)
+        labels = np.array(labels)  # Shape: (num_samples,)
+
+        # Perform K-Means clustering
+        num_clusters = len(np.unique(labels))  # Number of unique taxonomic labels
+        kmeans = KMeans(n_clusters=num_clusters, random_state=42)
+        cluster_assignments = kmeans.fit_predict(embeddings)
+
+        # Evaluate cluster homogeneity
+        homogeneity = homogeneity_score(labels, cluster_assignments)
+        completeness = completeness_score(labels, cluster_assignments)
+        v_meas = v_measure_score(labels, cluster_assignments)
+
+        output_file_path = "%s/%s" % (curr_dir, output_file_name)
+        if not os.path.exists(output_file_path):
+            output_file = open(output_file_path, "w")
+            output_file.write("model,taxonomy,homogeneity,completeness,v_measure\n")
+            output_file.close()
+
+        for model_name in models.keys():
+            output_file = open(output_file_path, "a")
+            output_file.write("%s,%s,%s,%s,%s\n" % (model_name,
+                                                    taxonomy,
+                                                    homogeneity,
+                                                    completeness,
+                                                    v_meas))
+            
+            print(f"Model: {model_name}, Taxonomy: {taxonomy}, Homogeneity: {homogeneity:.4f}, Completeness: {completeness:.4f}, V-measure: {v_meas:.4f}")
+            output_file.close()
+
+
+
+
+def generate_tier2_results(models, num_datasets, output_file_name, eval_datasets):
+
+    """
+    models: dictionary of loaded models
+    num_datasets: list of lowest and highest index of ProteinGym dataset to generate results for
+    output_file_name: string output file name
+    eval_datasets: list of datasets to perform UMAP evaluation of embeddings
+    """
+    
+    # Load in dataset names sorted from in ascending size
+    sequence_paths = []
+    tree_paths = []
+    curr_dir = os.getcwd()
+    summary_file = [dataset.strip().split(",") for dataset in open("%s/eval/proteingym_summary.csv" % curr_dir).readlines()]
+    file_names = np.array(summary_file)[:,0][1+num_datasets[0]:num_datasets[1]+1].tolist()
+    eval_datasets_names = [summary_file[1+i][-1] for i in eval_datasets]
+
+    # Save spearman values
+    linearprobe_spearmans = []
+    tier2_spearmans = []
+
+    # Iterate through all datasets
+    csv_dir_path = "/n/home11/ashen/proteingym_files/DMS_ProteinGym_substitutions"
+    temp_tree_path = "/n/home11/ashen/proteingym_files/DMS_tree_files/A0A1I9GEU1_NEIME_tree_old.nh" # TODO: Fix after generated all the original trees, now there's no need for reference trees since just doing tier2
+    # file_names = file_names[:10]
+    for dataset_name in tqdm(file_names, total=len(file_names)):
+
+        # Determine whether to generate UMAPs
+        eval_mode = False
+        if len(eval_datasets_names) != 0:
+            if dataset_name in eval_datasets_names:
+                eval_mode = True
+            else:
+                print("Skipping dataset %s since in eval mode" % dataset_name)
+                continue
+
+        # print("Generating results for %s" % dataset_name)
+
+        try: 
+            # Keep track of entire runtime for each dataset
+            start_time_full = time.time()
+
+            # Generate trees
+            sequence_path = "%s/%s.csv" % (csv_dir_path, dataset_name)
+            tree_dicts = {}
+            time_dict = {}
+            for model_name in models.keys():
+                
+                start_time = time.time()
+                tree_dict = generate_tree(seq_file = sequence_path,
+                                        tree_file = temp_tree_path,
+                                        model = models[model_name]["model"],
+                                        alphabet_tokenizer = models[model_name]["alphabet_tokenizer"],
+                                        model_name = model_name,
+                                        dataset_type = config.dataset.dataset, 
+                                        eval_mode = eval_mode)
+                end_time = time.time()
+                tree_dicts[model_name] = tree_dict
+                time_dict[model_name] = end_time - start_time
+
+                if eval_mode:
+                    break
+
+                # Save predicted tree into Newick string
+                # dir_path = "%s/eval/eval_preds/protein_gym/%s" % (curr_dir, dataset_name)
+                # if not os.path.exists(dir_path):
+                #     os.mkdir(dir_path)
+                # file_path = "%s/%s_pred_tree.nh" % (dir_path, model_name)
+                # with open(file_path, "w") as f:
+                #     f.write(tree_dict["pred_tree_str"])
+                #     f.close()
+
+            # Don't run rest of pipeline if in eval mode
+            if eval_mode:
+                continue
+            
+            # Save labels into annotation file (one per dataset)
+            # file_path = "%s/annotations.txt" % (dir_path)
+            # if not os.path.exists(file_path):
+            #     annotation_str = "taxa\tlabels_cont\tlabels_binary\n"
+            #     curr_name = tree_dict["names"][0]
+            #     curr_label_cont = tree_dict["labels_cont"][0]
+            #     curr_label_binary = tree_dict["labels_binary"][0]
+            #     annotation_str += "%s\t%s\t%s\n" % (curr_name, curr_label_cont, curr_label_binary)
+            #     annotation_str = annotation_str.strip()
+            #     with open(file_path, "w") as f:
+            #         f.write(annotation_str)
+            #         f.close()
+
+            # Evaluate Tier 2
+            tier2_dict = tier2_metric(tree_dicts)
+
+            # Keep track of entire runtime for each dataset
+            end_time_full = time.time()
+            elapsed_time_full = end_time_full - start_time
+
+            # Write results to output file
+            linearprobe_spearmans.append(tree_dicts[model_name]["corr_coeff_dict"]["spearman"])
+            tier2_spearmans.append(tier2_dict[model_name]["spearman"])
+            output_file_path = "%s/%s" % (curr_dir, output_file_name)
+            if not os.path.exists(output_file_path):
+                output_file = open(output_file_path, "w")
+                output_file.write("dataset,model,tier2_spearman,tier2_pearson,tier2_kendall,linear_probe_spearman,linear_probe_pearson,linear_probe_kendall,runtime,full_runtime\n")
+                # output_file.write("dataset,model,linear_probe_spearman,linear_probe_pearson,linear_probe_kendall,runtime,full_runtime\n")
+                output_file.close()
+            for model_name in models.keys():
+                output_file = open(output_file_path, "a")
+                # output_file.write("%s,%s,%s,%s,%s,%s,%s\n" % (dataset_name,
+                output_file.write("%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" % (dataset_name,
+                                                        model_name,
+                                                        tier2_dict[model_name]["spearman"],
+                                                        tier2_dict[model_name]["pearson"],
+                                                        tier2_dict[model_name]["kendall"],
+                                                        tree_dicts[model_name]["corr_coeff_dict"]["spearman"],
+                                                        tree_dicts[model_name]["corr_coeff_dict"]["pearson"],
+                                                        tree_dicts[model_name]["corr_coeff_dict"]["kendall"],
+                                                        time_dict[model_name],
+                                                        elapsed_time_full))
+                output_file.close()
+            
+        except RuntimeError as e:
+            if 'out of memory' in str(e):
+                print("OOM for dataset %s" % dataset_name)
+            else:
+                raise e
+    
+    output_model_name = output_file_name.split("results_")[-1][:-4]
+    print(f"\nAverage Linear Probe Spearman for {output_model_name}: {sum(linearprobe_spearmans)/len(linearprobe_spearmans)}")
+    print(f"\nAverage Tier 2 Spearman for {output_model_name}: {sum(tier2_spearmans)/len(tier2_spearmans)}")
+    print(f"Number of Successes for {output_model_name}: {len(tier2_spearmans)}")
+
+def generate_tier1_results(models, num_datasets, output_file_name, dataset_type, dictionary_data = None):
+
+    """
+    models: dictionary of loaded models
+    num_datasets: list of lowest and highest index of Openfold dataset to generate results for
+    output_file_name: string output file name
+    dataset_type: type of openfold dataset to evaluate between "openfold" and "openfold_small"
+    """
+    
+    # Load in dataset names sorted from in ascending size
+    curr_dir = os.getcwd()
+    if dataset_type == "openfold":
+        summary_file = [dataset.strip().split(",") for dataset in open("%s/eval/openfold_100_summary.csv" % curr_dir).readlines()]
+        file_names = np.array(summary_file)[:,0][num_datasets[0]+1:num_datasets[1]+1].tolist()
+    elif dataset_type == "openfold_small":
+        summary_file = [dataset.strip().split(",") for dataset in open("%s/eval/openfold_1000_summary.csv" % curr_dir).readlines()]
+        file_names = np.array(summary_file)[:,0][num_datasets[0]+1:num_datasets[1]+1].tolist()
+    elif dataset_type == "openfold_3tree":
+        file_names = ["A0A0D5C2P3", "K0T0F8", "X0VU39"]
+    elif dataset_type == "treebase":
+        # file_names = np.array(os.listdir("/n/holylfs06/LABS/mzitnik_lab/Lab/phyla_data_share/TreeBase/"))
+        file_names = np.loadtxt("/n/holylabs/LABS/mzitnik_lab/Users/ashen/phylo_genome_transformer/data/treebase_datasets_1533.txt", dtype=str)
+        file_names = file_names[num_datasets[0]:num_datasets[1]]
+    elif (dictionary_data is not None or output_file_name == None) and dataset_type == "treefam":
+        if output_file_name == None:
+            dictionary_data = pickle.load(open("/n/holylfs06/LABS/mzitnik_lab/Lab/phyla_data_share/TreeFam/treefam_alignments_and_trees_new.pkl", 'rb'))
+            file_names = list(dictionary_data.keys())[:500]
+        else:
+            file_names = list(dictionary_data.keys())
+    # Iterate through all datasets
+    if dataset_type == "openfold":
+        seq_dir_path = "/n/home11/ashen/openfold_files/openfold_100_seqs"
+    elif dataset_type == "openfold_small":
+        seq_dir_path = "/n/home11/ashen/openfold_files/openfold_1000_seqs"
+    elif dataset_type == "openfold_3tree":
+        seq_dir_path = "/n/holylabs/LABS/mzitnik_lab/Users/ashen/phylo_genome_transformer/data/openfold_small"
+    elif dataset_type == "treebase":
+        # seq_dir_path = "/n/holylfs06/LABS/mzitnik_lab/Users/ashen/treebase_files/treebase_seqs"
+        seq_dir_path = "/n/holylfs06/LABS/mzitnik_lab/Users/ashen/treebase_files/treebase_seqs_1533"
+    elif dataset_type == "treefam":
+        seq_dir_path = ""
+    # Define paths to tree directories
+    if dataset_type == "treebase":
+        # tree_dir_path = "/n/holylfs06/LABS/mzitnik_lab/Users/ashen/treebase_files/treebase_trees"
+        tree_dir_path = "/n/holylfs06/LABS/mzitnik_lab/Users/ashen/treebase_files/treebase_trees_1533"
+    elif dataset_type == "treefam":
+        tree_dir_path = ""
+    else:
+        tree_dir_path = "/n/holystore01/LABS/mzitnik_lab/Lab/Open_Protein_Set"   # Using the approximated trees Yasha generated
+
+    # Iterate
+    normrfs = [] # For saving normRF values if running validation callback
+    tree_sizes = []
+
+    output_file_path = "%s/%s" % (curr_dir, output_file_name)
+    output_file = open(output_file_path, "w")
+
+    # Iterate through all datasets
+    for dataset_name in tqdm(file_names, total=len(file_names)):
+
+        # Skipping one dataset that triggers custom error
+        if dataset_name == "TF352211":
+            print("Skipping dataset %s" % dataset_name)
+            continue
+
+        # Check if dataset_name is in faulty_files
+        if dataset_type == "treebase":
+            faulty_files_path = "/n/holylfs06/LABS/mzitnik_lab/Users/ashen/treebase_files/faulty_files.txt"
+            with open(faulty_files_path, "r") as f:
+                if dataset_name in f.read():
+                    print(f"{dataset_name} in faulty files so not generating")
+                    continue
+
+        # print("Generating results for %s" % dataset_name)
+
+        try: 
+            # Keep track of entire runtime for each dataset
+            start_time_full = time.time()
+
+            # Generate trees
+            sequence_path = "%s/%s.fa" % (seq_dir_path, dataset_name)
+            tree_path = "%s/%s_tree.nh" % (tree_dir_path, dataset_name)
+            tree_dicts = {}
+            time_dict = {}
+            general_error = False
+            for model_name in models.keys():
+
+                tree_dict = generate_tree(seq_file = sequence_path,
+                                            tree_file = tree_path,
+                                            model = models[model_name]["model"],
+                                            alphabet_tokenizer = models[model_name]["alphabet_tokenizer"],
+                                            model_name = model_name,
+                                            dataset_type = dataset_type, 
+                                            eval_mode = False,
+                                            convert_to_aa = False,
+                                            dictionary_data = dictionary_data[dataset_name] if dictionary_data is not None else None,
+                                            random = 42
+                                            )
+
+                start_time = time.time()
+                # TODO: Added in temporary try-catch for ESM2 and ESM2_3B for TreeBase
+                # try:
+                #     tree_dict = generate_tree(seq_file = sequence_path,
+                #                             tree_file = tree_path,
+                #                             model = models[model_name]["model"],
+                #                             alphabet_tokenizer = models[model_name]["alphabet_tokenizer"],
+                #                             model_name = model_name,
+                #                             dataset_type = config.dataset.dataset, 
+                #                             eval_mode = False)
+                # except:
+                #     print("General unknown error, skipping this sample")
+                #     general_error = True
+                #     continue
+
+                end_time = time.time()
+                tree_dicts[model_name] = tree_dict
+                time_dict[model_name] = end_time - start_time
+
+                # Save predicted tree into Newick string
+                # if dataset_type == "openfold":
+                #     dir_path = "%s/eval/eval_preds/openfold/%s" % (curr_dir, dataset_name)
+                # elif dataset_type == "openfold_small":
+                #     dir_path = "%s/eval/eval_preds/openfold_small/%s" % (curr_dir, dataset_name)
+                # elif dataset_type == "openfold_3tree":
+                #     dir_path = "%s/eval/eval_preds/openfold_3tree/%s" % (curr_dir, dataset_name)
+                # if not os.path.exists(dir_path):
+                #     os.mkdir(dir_path)
+                # file_path = "%s/%s_pred_tree.nh" % (dir_path, model_name)
+                # with open(file_path, "w") as f:
+                #     f.write(tree_dict["pred_tree_str"])
+                #     f.close()
+
+            # TODO: Added in temporary try-catch for ESM2 and ESM2_3B for TreeBase
+            if general_error:
+                continue
+
+            # Evaluate Tier 1
+            tier1_dict = tier1_metric(tree_dicts)
+
+            # Keep track of entire runtime for each dataset
+            end_time_full = time.time()
+            elapsed_time_full = end_time_full - start_time
+
+            # If running code in validation callback, skip writing to output file
+            if output_file_name == None:
+                normrfs.append(tier1_dict["MAMBA"]["norm_rf"])
+                tree_sizes.append(len(tree_dict['names']))
+            # If not running code in validation callback, write to output file
+            else:
+                # Still add values to normrfs 
+                model_id = output_file_name.split("_")[3][1:]
+                normrfs.append(tier1_dict[f"MAMBA{model_id}"]["norm_rf"])
+                # Write results to output file
+                output_file_path = "%s/%s" % (curr_dir, output_file_name)
+                if not os.path.exists(output_file_path):
+                    output_file = open(output_file_path, "w")
+                    output_file.write("dataset,model,rf,max_rf,norm_rf,runtime,full_runtime\n")
+                    output_file.close()
+                for model_name in models.keys():
+                    output_file = open(output_file_path, "a")
+                    output_file.write("%s,%s,%s,%s,%s,%s,%s\n" % (dataset_name,
+                                                            model_name,
+                                                            tier1_dict[model_name]["rf"],
+                                                            tier1_dict[model_name]["max_rf"],
+                                                            tier1_dict[model_name]["norm_rf"],
+                                                            time_dict[model_name],
+                                                            elapsed_time_full))
+                    output_file.close()
+
+        except RuntimeError as e:
+            if 'out of memory' in str(e):
+                print("OOM for dataset %s" % dataset_name)
+            else:
+                raise e
+    
+            
+    # If running code in validation callback, return all predicted normRF values
+    if output_file_name == None:
+        # return normrfs
+        return normrfs, tree_sizes
+    else:
+        output_model_name = output_file_name.split("results_")[-1][:-4]
+        print(f"\nAverage NormRF for {output_model_name}: {sum(normrfs)/len(normrfs)}")
+        print(f"Number of Successes for {output_model_name}: {len(normrfs)}")
+    
+def generate_swisstree_results(models, num_datasets, output_file_name):
+
+    """
+    models: dictionary of loaded models
+    num_datasets: list of lowest and highest index of ProteinGym dataset to generate results for
+    output_file_name: string output file name
+    """
+
+    # Generate tree
+    print("Generating results for SwissTree...")
+    for model_name in models.keys():
+        
+        tree_dict = generate_tree(seq_file = None,
+                                tree_file = None,
+                                model = models[model_name]["model"],
+                                alphabet = models[model_name]["alphabet"],
+                                model_name = model_name,
+                                dataset_type = config.dataset.dataset, 
+                                eval_mode = False)
+
+        print("Tree successfully generated!")
+    
+    # Save distances in tsv format for upload
+    num_seqs = len(tree_dict["pdm"].keys())
+    dict_keys = list(tree_dict["pdm"].keys())
+    out_str = ""
+    for i in range(num_seqs):
+        for j in range(i+1, num_seqs):
+            # Extract each unique combination of sequences
+            curr_row = dict_keys[i]
+            curr_col = dict_keys[j]
+            curr_dist = tree_dict["pdm"][curr_row][curr_col][0]
+            # Format string
+            out_str += f"{curr_row}\t{curr_col}\t{curr_dist}\n"
+
+    # Write to output file
+    with open(output_file_name, "w") as f:
+        f.write(out_str.strip())
+        f.close()
+
+
+if __name__ == "__main__":
+    print("\nRunning evaluate...")
+    config = load_config(Config)
+
+    # Load model
+    print("\nLoading model %s..." % config.trainer.model_type)
+    models = {}
+    if "MAMBA" in config.trainer.model_type:
+        mamba_model_dict = load_model(checkpoint_file = config.trainer.checkpoint_path, config = config.model)
+        models["MAMBA%s" % config.trainer.checkpoint_id] = mamba_model_dict
+    elif config.trainer.model_type == "ESM2":
+        esm2_model_dict = load_model(config=ESM2_ModelConfig())
+        models["ESM2"] = esm2_model_dict
+    elif config.trainer.model_type == "EVO":
+        evo_model_dict = load_model(config=EVO_ModelConfig())
+        models["EVO"] = evo_model_dict
+    elif config.trainer.model_type == "MSA-TRANSFORMER":
+        msa_transformer_model_dict = load_model(config=MSA_TRANSFORMER_ModelConfig())
+        models["MSA-TRANSFORMER"] = msa_transformer_model_dict
+    elif config.trainer.model_type == "ESM3":
+        # Only load ESM3 libraries if using ESM3
+        from esm.models.esm3 import ESM3
+        from esm.sdk.api import ESMProtein, SamplingConfig
+        from esm.utils.constants.models import ESM3_OPEN_SMALL
+        esm3_model_dict = load_model(config=ESM3_ModelConfig())
+        models["ESM3"] = esm3_model_dict
+    elif config.trainer.model_type == "ESM2_3B":
+        esm2_3b_model_dict = load_model(config=ESM2_3B_ModelConfig())
+        models["ESM2_3B"] = esm2_3b_model_dict
+
+    # Generate Tier1 or Tier2 results
+    if config.dataset.dataset == "protein_gym":
+        last_dataset_id = 83
+        if "MAMBA" in config.trainer.model_type:
+            output_file = "eval/eval_preds/protein_gym/protein_gym_results_#%s_%sk_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=0")[2][0:5])//1000, last_dataset_id)
+            # output_file = "eval/eval_preds/protein_gym/protein_gym_results_#%s_%sk_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=")[-1][:-5])//1000, last_dataset_id)
+        else:
+            output_file = "eval/eval_preds/protein_gym/protein_gym_results_%s_%s.csv" % (config.trainer.model_type, last_dataset_id)
+        num_datasets = [0, last_dataset_id]   # Start with the smallest 83 datasets for MAMBA's current 80GB GPU constraints
+        # eval_datasets = [31, 54]   # Specify which datasets to plot UMAPs for
+        eval_datasets = []
+        generate_tier2_results(models, num_datasets, output_file, eval_datasets)
+
+    elif config.dataset.dataset == "openfold":
+        last_dataset_id = 89
+        if "MAMBA" in config.trainer.model_type:
+            output_file = "eval/eval_preds/openfold/openfold_results_#%s_%sk_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=0")[2][0:5])//1000, last_dataset_id)
+            # output_file = "eval/eval_preds/openfold/openfold_results_#%s_%sk_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=")[-1][:-5])//1000, last_dataset_id)
+        else:
+            output_file = "eval/eval_preds/openfold/openfold_results_%s_%s.csv" % (config.trainer.model_type, last_dataset_id)
+        num_datasets = [0, last_dataset_id]
+        generate_tier1_results(models, num_datasets, output_file, config.dataset.dataset)
+    
+    elif config.dataset.dataset == "openfold_small":
+        last_dataset_id = 201
+        if "MAMBA" in config.trainer.model_type:
+            output_file = "eval/eval_preds/openfold_small/openfold_small_results_#%s_%sk_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=0")[2][0:5])//1000, last_dataset_id)
+            # output_file = "eval/eval_preds/openfold_small/openfold_small_results_#%s_%sk_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=")[-1][:-5])//1000, last_dataset_id)
+        else:
+            output_file = "eval/eval_preds/openfold_small/openfold_small_results_%s_%s.csv" % (config.trainer.model_type, last_dataset_id)
+        num_datasets = [0, last_dataset_id]
+        generate_tier1_results(models, num_datasets, output_file, config.dataset.dataset)
+    
+    elif config.dataset.dataset == "treefam":
+        data = pickle.load(open("/n/holylfs06/LABS/mzitnik_lab/Lab/phyla_data_share/TreeFam/treefam_alignments_and_trees_new.pkl", 'rb'))
+        num_datasets = [0, len(data)]
+        last_dataset_id = len(data)
+
+        if "MAMBA" in config.trainer.model_type:
+            output_file = "eval/eval_preds/treefam/treefam_results_#%s_%sk_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=0")[2][0:5])//1000, last_dataset_id)
+            # output_file = "eval/eval_preds/treefam/treefam_results_#%s_%sk_%s_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=0")[2][0:5])//1000, last_dataset_id, config.eval.extra_name)
+            # output_file = "eval/eval_preds/treefam/treefam_results_#%s_%sk_%s_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=")[-1][:-5])//1000, last_dataset_id, config.eval.extra_name)
+        else:
+            output_file = "eval/eval_preds/treefam/treefam_results_%s_%s_%s.csv" % (config.trainer.model_type, last_dataset_id, config.eval.extra_name)
+
+        generate_tier1_results(models, num_datasets, output_file, config.dataset.dataset, dictionary_data=data)
+    
+    elif config.dataset.dataset == "openfold_3tree":
+        last_dataset_id = 3
+        output_file = "eval/eval_preds/openfold_3tree/openfold_3tree_results_#%s_%sk_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=0")[2][0:5])//1000, last_dataset_id)
+        # output_file = "eval/eval_preds/openfold_3tree/openfold_3tree_results_#%s_%sk_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=")[-1][:-5])//1000, last_dataset_id)
+        num_datasets = [0, last_dataset_id]
+        generate_tier1_results(models, num_datasets, output_file, config.dataset.dataset)
+
+    elif config.dataset.dataset == "treebase":
+        last_dataset_id = 5822
+        if "MAMBA" in config.trainer.model_type:
+            if "random" in config.trainer.model_type:
+                output_file = "eval/eval_preds/treebase/treebase_results_random_%s.csv" % ( last_dataset_id)
+            else:
+                output_file = "eval/eval_preds/treebase/treebase_results_#%s_%sk_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=0")[2][0:5])//1000, last_dataset_id)
+                # output_file = "eval/eval_preds/treebase/treebase_results_#%s_%sk_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=")[-1][:-5])//1000, last_dataset_id)
+        else:
+            output_file = "eval/eval_preds/treebase/treebase_results_%s_%s.csv" % (config.trainer.model_type, last_dataset_id)
+        num_datasets = [0, last_dataset_id]
+        generate_tier1_results(models, num_datasets, output_file, config.dataset.dataset)
+
+    # Generate SwissTree results
+    elif config.dataset.dataset == "swisstree":
+        last_dataset_id = 651
+        if "MAMBA" in config.trainer.model_type:
+            output_file = "eval/eval_preds/swisstree/swisstree_results_#%s_%sk_%s.tsv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=0")[2][0:5])//1000, last_dataset_id)
+            # output_file = "eval/eval_preds/swisstree/swisstree_results_#%s_%sk_%s.tsv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=")[-1][:-5])//1000, last_dataset_id)
+        else:
+            output_file = "eval/eval_preds/swisstree/swisstree_results_%s_%s.tsv" % (config.trainer.model_type, last_dataset_id)
+        num_datasets = [0, last_dataset_id]
+        generate_swisstree_results(models, num_datasets, output_file)
+    
+    elif config.dataset.dataset == "GTB":
+        last_dataset_id = 120
+
+        if "MAMBA" in config.trainer.model_type:
+            if "random" in config.trainer.model_type:
+                output_file = "eval/eval_preds/GTB/GTB_results_random_%s_%s.csv" % ( last_dataset_id, config.eval.extra_name)
+            else:
+                output_file = "eval/eval_preds/GTB/GTB_results_#%s_%sk_%s_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=0")[2][0:5])//1000, last_dataset_id, config.eval.extra_name)
+                # output_file = "eval/eval_preds/GTB/GTB_results_#%s_%sk_%s_%s.csv" % (config.trainer.checkpoint_id, int(config.trainer.checkpoint_path.split("=")[-1][:-5])//1000, last_dataset_id, config.eval.extra_name)
+        else:
+            output_file = "eval/eval_preds/GTB/GTB_results_%s_%s_%s.csv" % (config.trainer.model_type, last_dataset_id, config.eval.extra_name)
+
+        num_datasets = [0, last_dataset_id]
+
+        taxonomy_to_files = {}
+        location = "/n/holylfs06/LABS/mzitnik_lab/Lab/phyla_data_share/GTB_dataset/"
+        for filename in os.listdir(location):
+            if 'sampled_bac120_taxonomy' in filename:
+                if '.pickle' in filename:
+                    taxonomy = filename.split("_")[-2]
+                    if taxonomy not in taxonomy_to_files:
+                        taxonomy_to_files[taxonomy] = {}
+                    taxonomy_to_files[taxonomy]['sequences'] = f'{location}{filename}'
+                elif '.tsv' in filename:
+                    taxonomy = filename.split("_")[-1].split('.')[0]
+                    if taxonomy not in taxonomy_to_files:
+                        taxonomy_to_files[taxonomy] = {}
+                    taxonomy_to_files[taxonomy]['labels'] = f'{location}{filename}'
+
+        generate_clustering_GTB_results(models, output_file, "eval/eval_preds/GTB/", taxonomy_to_files)
+    else:
+        #Assume you just want to run one sequence and config.dataset.dataset is a path to the specific entry that you want to run, no output file, debugging mode
+        #This won't work so I stopped it instead throwing an exception to stop anyone potentially to do this
+        raise Exception("You need a dataset name")
+        generate_tier1_results(models, None, None, config.dataset.dataset)
