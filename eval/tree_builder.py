@@ -354,7 +354,7 @@ def generate_tree(seq_file, tree_file, model, alphabet_tokenizer, model_name, da
         ref_tree_str = tree.format("newick")
     
     elif dataset_type in ["swisstree"]:
-        swisstree_dataset_path = "/n/holystore01/LABS/mzitnik_lab/Lab/ashen/swisstree/"
+        swisstree_dataset_path = ""
 
         # Extract each sequence from the 651 separate fasta files
         for file_path in os.listdir(swisstree_dataset_path):
@@ -987,8 +987,8 @@ def generate_tier2_results(models, num_datasets, output_file_name, eval_datasets
     tier2_spearmans = []
 
     # Iterate through all datasets
-    csv_dir_path = "/n/home11/ashen/proteingym_files/DMS_ProteinGym_substitutions"
-    temp_tree_path = "/n/home11/ashen/proteingym_files/DMS_tree_files/A0A1I9GEU1_NEIME_tree_old.nh" # TODO: Fix after generated all the original trees, now there's no need for reference trees since just doing tier2
+    csv_dir_path = ""
+    temp_tree_path = "" # TODO: Fix after generated all the original trees, now there's no need for reference trees since just doing tier2
     # file_names = file_names[:10]
     for dataset_name in tqdm(file_names, total=len(file_names)):
 
@@ -1116,35 +1116,35 @@ def generate_tier1_results(models, num_datasets, output_file_name, dataset_type,
     elif dataset_type == "openfold_3tree":
         file_names = ["A0A0D5C2P3", "K0T0F8", "X0VU39"]
     elif dataset_type == "treebase":
-        # file_names = np.array(os.listdir("/n/holylfs06/LABS/mzitnik_lab/Lab/phyla_data_share/TreeBase/"))
-        file_names = np.loadtxt("/n/holylabs/LABS/mzitnik_lab/Users/ashen/phylo_genome_transformer/data/treebase_datasets_1533.txt", dtype=str)
+        # file_names = np.array(os.listdir(""))
+        file_names = np.loadtxt("", dtype=str)
         file_names = file_names[num_datasets[0]:num_datasets[1]]
     elif (dictionary_data is not None or output_file_name == None) and dataset_type == "treefam":
         if output_file_name == None:
-            dictionary_data = pickle.load(open("/n/holylfs06/LABS/mzitnik_lab/Lab/phyla_data_share/TreeFam/treefam_alignments_and_trees_new.pkl", 'rb'))
+            dictionary_data = pickle.load(open("", 'rb'))
             file_names = list(dictionary_data.keys())[:500]
         else:
             file_names = list(dictionary_data.keys())
     # Iterate through all datasets
     if dataset_type == "openfold":
-        seq_dir_path = "/n/home11/ashen/openfold_files/openfold_100_seqs"
+        seq_dir_path = ""
     elif dataset_type == "openfold_small":
-        seq_dir_path = "/n/home11/ashen/openfold_files/openfold_1000_seqs"
+        seq_dir_path = ""
     elif dataset_type == "openfold_3tree":
-        seq_dir_path = "/n/holylabs/LABS/mzitnik_lab/Users/ashen/phylo_genome_transformer/data/openfold_small"
+        seq_dir_path = ""
     elif dataset_type == "treebase":
-        # seq_dir_path = "/n/holylfs06/LABS/mzitnik_lab/Users/ashen/treebase_files/treebase_seqs"
-        seq_dir_path = "/n/holylfs06/LABS/mzitnik_lab/Users/ashen/treebase_files/treebase_seqs_1533"
+        # seq_dir_path = ""
+        seq_dir_path = ""
     elif dataset_type == "treefam":
         seq_dir_path = ""
     # Define paths to tree directories
     if dataset_type == "treebase":
-        # tree_dir_path = "/n/holylfs06/LABS/mzitnik_lab/Users/ashen/treebase_files/treebase_trees"
-        tree_dir_path = "/n/holylfs06/LABS/mzitnik_lab/Users/ashen/treebase_files/treebase_trees_1533"
+        # tree_dir_path = ""
+        tree_dir_path = ""
     elif dataset_type == "treefam":
         tree_dir_path = ""
     else:
-        tree_dir_path = "/n/holystore01/LABS/mzitnik_lab/Lab/Open_Protein_Set"   # Using the approximated trees Yasha generated
+        tree_dir_path = ""   # Using the approximated trees generated
 
     # Iterate
     normrfs = [] # For saving normRF values if running validation callback
@@ -1163,7 +1163,7 @@ def generate_tier1_results(models, num_datasets, output_file_name, dataset_type,
 
         # Check if dataset_name is in faulty_files
         if dataset_type == "treebase":
-            faulty_files_path = "/n/holylfs06/LABS/mzitnik_lab/Users/ashen/treebase_files/faulty_files.txt"
+            faulty_files_path = ""
             with open(faulty_files_path, "r") as f:
                 if dataset_name in f.read():
                     print(f"{dataset_name} in faulty files so not generating")
@@ -1386,7 +1386,7 @@ if __name__ == "__main__":
         generate_tier1_results(models, num_datasets, output_file, config.dataset.dataset)
     
     elif config.dataset.dataset == "treefam":
-        data = pickle.load(open("/n/holylfs06/LABS/mzitnik_lab/Lab/phyla_data_share/TreeFam/treefam_alignments_and_trees_new.pkl", 'rb'))
+        data = pickle.load(open("", 'rb'))
         num_datasets = [0, len(data)]
         last_dataset_id = len(data)
 
@@ -1445,7 +1445,7 @@ if __name__ == "__main__":
         num_datasets = [0, last_dataset_id]
 
         taxonomy_to_files = {}
-        location = "/n/holylfs06/LABS/mzitnik_lab/Lab/phyla_data_share/GTB_dataset/"
+        location = ""
         for filename in os.listdir(location):
             if 'sampled_bac120_taxonomy' in filename:
                 if '.pickle' in filename:
