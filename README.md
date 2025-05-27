@@ -1,5 +1,3 @@
-Codebase for "Sequence Modeling Is Not Evolutionary Reasoning" submission to NeurIPS 2025
-
 # Tree Reasoning Benchmark
 
 The **Tree Reasoning Benchmark** consists of two tasks across three datasets. It evaluates a model's ability in:
