@@ -1,3 +1,13 @@
+# Run Phyla
+
+## Phyla weights
+
+1.  Weights for Phyla (no ablation) can be downloaded from here: https://tinyurl.com/mw58wwbd
+2.  Weights for Phyla (without tree loss and trained with masked language modeling) can be downloaded from here: https://tinyurl.com/ye24hy6c
+3.  Weights for Phyla (with no sparsified attention): https://tinyurl.com/34yd5jed
+
+
+
 # Tree Reasoning Benchmark
 
 The **Tree Reasoning Benchmark** consists of two tasks across three datasets. It evaluates a model's ability in:
@@ -7,14 +17,6 @@ The **Tree Reasoning Benchmark** consists of two tasks across three datasets. It
 
 2. **Taxonomic Clustering**  
    - Measured by **cluster completeness** and **Normalized Mutual Information** (**NMI**).
-
----
-
-## 📦 Download Instructions
-
-To download the benchmark datasets, visit:
-
-👉 [Harvard Dataverse - Tree Reasoning Benchmark (DRAFT)](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi%3A10.7910%2FDVN%2FRKZWLQ&version=DRAFT)
 
 ---
 
@@ -28,8 +30,8 @@ To download the benchmark datasets, visit:
 
 **Datasets Used:**
 
-- `TreeFam`
-- `TreeBASE`
+- `TreeFam` found in a pickle file here: https://tinyurl.com/yh78swxd
+- `TreeBASE` found in a zip file here: https://tinyurl.com/ke8pjyw7
 
 ### TreeBASE Details
 
@@ -59,7 +61,7 @@ To download the benchmark datasets, visit:
 
 **Dataset Used:**
 
-- `GTDB` (Genome Taxonomy Database)
+- `GTDB` (Genome Taxonomy Database) found in a tar-file here: https://tinyurl.com/3rhyfu7t
 
 ### GTDB Details
 
