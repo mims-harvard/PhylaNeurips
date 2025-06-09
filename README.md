@@ -1,11 +1,16 @@
 # Run Phyla
 
-## Phyla weights
+## Phyla Weights
 
 1.  Weights for Phyla (no ablation) can be downloaded from here: https://tinyurl.com/mw58wwbd
 2.  Weights for Phyla (without tree loss and trained with masked language modeling) can be downloaded from here: https://tinyurl.com/ye24hy6c
 3.  Weights for Phyla (with no sparsified attention): https://tinyurl.com/34yd5jed
 
+## Running Phyla
+
+To run Phyla on a basic input of fasta files see ```run_phyla_test.py```.
+
+Do not change anything except the device to run the correct version of Phyla
 
 
 # Tree Reasoning Benchmark
