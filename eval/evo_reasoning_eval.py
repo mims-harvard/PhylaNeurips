@@ -249,18 +249,25 @@ def generate_tree(seq_file,
         sequence_embeddings = torch.stack(sequence_embeddings).unsqueeze(0)
 
     elif model_name == "EVO":
-        # TODO: Convert to the recommended EVO pipeline for generating embeddings
-        import pdb; pdb.set_trace()
-
-        # Generate token representations with batched sequence format
-        num_seqs = batch["sequence_lengths"].shape[1]
-        seq_length = batch["sequence_lengths"][0][0]
-        batch["encoded_sequences"] = batch["encoded_sequences"].squeeze().view((num_seqs,seq_length))
-        seqs_per_chunk = (max_aa_dict["EVO"] // seq_length_dict[dataset_name])
+        sequences = [seq.replace(".", "L") for seq in sequences]
+        sequences = [reverse_translate(seq) for seq in sequences]
+        # Generate sequence embeddings in batches
         logits = torch.Tensor([])
-        for i in range(0, batch["encoded_sequences"].shape[0], seqs_per_chunk):
+        num_seqs = len(sequences)
+
+        # For manual padding to deal with different max sizes in sub-batches
+        max_seq_length = max([len(seq) for seq in sequences])
+        seqs_per_chunk = (max_aa_dict["EVO"] // max_seq_length)
+        device = 'cuda:0'
+        for i in range(0, num_seqs, seqs_per_chunk):
             with torch.no_grad():
-                results = model(batch["encoded_sequences"][i:i+seqs_per_chunk].to(device))[0]
+                input_ids, seq_lengths = prepare_batch(sequences[i:i+seqs_per_chunk], alphabet_tokenizer, prepend_bos=False, device=device)
+                # Manually pad
+                curr_num_to_pad = max_seq_length - input_ids.shape[1]
+                input_ids = torch.cat((input_ids, torch.ones(input_ids.shape[0], curr_num_to_pad, dtype=torch.int64).cuda()),dim=1)
+                # input_ids = torch.cat((input_ids, torch.ones(input_ids.shape[0], curr_num_to_pad, dtype=torch.int64, device=device)),dim=1)
+                results, _ = model(input_ids)
+            # TODO: Logits might not be correct, may need embeddings
             logits = torch.cat((logits, results.detach().cpu()))
         sequence_embeddings = logits.mean(1).unsqueeze(0)
     
@@ -275,6 +282,75 @@ def generate_tree(seq_file,
             token_embeddings = output.per_residue_embedding
             sequence_embeddings.append(token_embeddings.mean(0).unsqueeze(0))
         sequence_embeddings = torch.cat(sequence_embeddings).unsqueeze(0)
+    
+    elif model_name in ["ESMC_300M", "ESMC_600M"]:
+
+        # Calculate sequence embeddings 
+        max_seq_length = max([len(seq) for seq in sequences]) + 2 # Adding +2 because of the built-in ESMC tokenization strategy
+        sequence_embeddings = []
+        for sequence in sequences:
+            protein = ESMProtein(sequence=sequence)
+            protein_tensor = model.encode(protein)
+
+            # Manually pad
+            curr_num_to_pad = max_seq_length - len(protein_tensor)
+            protein_tensor.sequence = torch.cat((protein_tensor.sequence, torch.ones(curr_num_to_pad, dtype=torch.int64).cuda()))
+
+            logits_output = model.logits(protein_tensor, LogitsConfig(sequence=True, return_embeddings=True))
+            sequence_embeddings.append((logits_output.embeddings).squeeze().mean(0).unsqueeze(0))
+        sequence_embeddings = torch.cat(sequence_embeddings).unsqueeze(0)
+    
+    elif model_name == "EVO2":
+        
+        # sequence_embeddings = []
+        # for sequence in sequences:
+        #     input_ids = torch.tensor(alphabet_tokenizer.tokenize(sequence), dtype=torch.int).unsqueeze(0).to('cuda:0')
+        #     layer_name = 'blocks.28.mlp.l3'
+        #     outputs, embeddings = model(input_ids, return_embeddings=True, layer_names=[layer_name])
+        #     sequence_embeddings.append(embeddings[layer_name].squeeze().mean(0).unsqueeze(0))
+        # sequence_embeddings = torch.cat(sequence_embeddings).unsqueeze(0)
+        # sequence_embeddings = sequence_embeddings.to(torch.float64)
+
+        dataset_batch_size = 10
+
+        from torch.cuda import OutOfMemoryError
+        import gc
+
+        def get_embeddings(sequences, batch_size):
+            sequence_embeddings = []
+            for i in range(0, len(sequences), batch_size):
+                batch = sequences[i:i + batch_size]
+                input_ids = [
+                    torch.tensor(alphabet_tokenizer.tokenize(seq), dtype=torch.int)
+                    for seq in batch
+                ]
+                input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
+                input_ids = input_ids.to('cuda:0')
+
+                layer_name = 'blocks.28.mlp.l3'
+                outputs, embeddings = model(input_ids, return_embeddings=True, layer_names=[layer_name])
+                emb = embeddings[layer_name].mean(dim=1)  # mean over sequence length
+                sequence_embeddings.append(emb)
+            return torch.cat(sequence_embeddings, dim=0).unsqueeze(0).to(torch.float64)
+
+        try:
+            sequence_embeddings = get_embeddings(sequences, batch_size=dataset_batch_size)
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print("OOM at batch_size=2, retrying with batch_size=1")
+                torch.cuda.empty_cache()
+                gc.collect()
+                dataset_batch_size = 1
+                sequence_embeddings = get_embeddings(sequences, batch_size=dataset_batch_size)
+            else:
+                raise e
+    elif model_name == "PROGEN2_XLARGE" or model_name == "PROGEN2_LARGE":
+        sequence_embeddings = []
+        for seq in sequences:
+            target = torch.tensor(alphabet_tokenizer.encode(seq).ids).cuda()
+            hidden_states =  model(target, labels=target, hidden_state_override=True).detach().cpu()
+            sequence_embeddings.append(hidden_states[1:-1].mean(dim=0))
+        sequence_embeddings = torch.stack(sequence_embeddings).float().unsqueeze(0).detach().cpu()
 
     # Calculate linear probe value if evaluting Tier 2
     if dataset_type in ["protein_gym1", "protein_gym2", "protein_gym"]:
@@ -978,15 +1054,7 @@ def tree_reconstruction_benchmark(models, num_datasets, output_file_name, datase
     
     # Load in dataset names sorted from in ascending size
     curr_dir = os.getcwd()
-    if dataset_type == "openfold":
-        summary_file = [dataset.strip().split(",") for dataset in open("%s/eval/openfold_100_summary.csv" % curr_dir).readlines()]
-        file_names = np.array(summary_file)[:,0][num_datasets[0]+1:num_datasets[1]+1].tolist()
-    elif dataset_type == "openfold_small":
-        summary_file = [dataset.strip().split(",") for dataset in open("%s/eval/openfold_1000_summary.csv" % curr_dir).readlines()]
-        file_names = np.array(summary_file)[:,0][num_datasets[0]+1:num_datasets[1]+1].tolist()
-    elif dataset_type == "openfold_3tree":
-        file_names = ["A0A0D5C2P3", "K0T0F8", "X0VU39"]
-    elif dataset_type == "treebase":
+    if dataset_type == "treebase":
         # file_names = np.array(os.listdir(""))
         file_names = np.loadtxt("./data/treebase_datasets_1533.txt", dtype=str)
         file_names = file_names[num_datasets[0]:num_datasets[1]]

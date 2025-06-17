@@ -10,8 +10,7 @@
 
 To run Phyla on a basic input of fasta files see ```run_phyla_test.py```.
 
-Do not change anything except the device to run the correct version of Phyla
-
+> ⚠️ Do not change anything except the device to run the correct version of Phyla
 
 # Tree Reasoning Benchmark
 
@@ -89,5 +88,52 @@ The **Tree Reasoning Benchmark** consists of two tasks across three datasets. It
 - The corresponding `.pickle` file contains the actual sequences for those entries.
 
 > Each replicate includes random groupings of 50 distinct labels, with 10 sequences per label. Use the taxonomic column in the `.tsv` and the sequence names to extract the clustering labels.
+
+---
+
+# Evaluation Instructions
+
+To evaluate tree reconstruction, taxonomic clustering, or functional prediction, run:
+
+```bash
+python -m eval.evo_reasoning_eval configs/sample_eval_config.yaml
+```
+
+### Modifying the Config
+
+Open and modify `configs/sample_eval_config.yaml` as needed:
+
+#### 1. `trainer.model_type`
+
+Choose the model to run:
+
+- `Phyla-beta` (default Phyla model)
+- `ESM2` (ESM2 650M)
+- `ESM2_3B` (ESM2 3B)
+- `ESM3`
+- `EVO`
+- `PROGEN2_LARGE`
+- `PROGEN2_XLARGE`
+
+#### 2. `dataset.dataset`
+
+Set one of the following datasets:
+
+- `treebase` – For tree reconstruction (TreeBASE)
+- `treefam` – For tree reconstruction (TreeFam)
+- `GTB` – For taxonomic clustering (GTDB)
+- `protein_gym` – For functional prediction
+
+> Required files will be downloaded automatically.
+
+#### 3. `evaluating.device`
+
+Set the GPU device to use (e.g., `"cuda:0"`, `"cuda:5"`).
+
+#### 4. `evaluating.random`
+
+Set this to `true` to evaluate a randomly initialized model (default is `false`).
+
+
 
 
