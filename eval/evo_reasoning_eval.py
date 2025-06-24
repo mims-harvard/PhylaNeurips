@@ -25,6 +25,7 @@ from sklearn.neural_network import MLPRegressor
 from statistics import mean
 from scipy.stats import spearmanr, pearsonr, kendalltau
 from sklearn.metrics.cluster import normalized_mutual_info_score
+from eval.TreeCluster import run_treecluster
 
 import time
 # import umap
@@ -96,23 +97,8 @@ def generate_tree(seq_file,
     names = []
     labels_binary = []
     labels_cont = []
-    ref_tree_str = ""
 
-    if dataset_type in ["protein_gym_sample"]:
-        seq_id_counter = 0
-        for i in open(seq_file).readlines():
-            data = i.split(',')
-            sequences.append(data[0].rstrip())
-            padding_zeros = (4 - len(str(seq_id_counter)))*"0"
-            names.append("seq%s%s" % (padding_zeros, seq_id_counter)) # Generate unique id for each sequence
-            labels_cont.append(float(data[1]))
-            labels_binary.append(int(data[2]))
-            seq_id_counter += 1
-        # Format for later RF calculation
-        f = open(tree_file, "r").read()
-        ref_tree_str = "".join([val.split("_")[1] if len(val.split("_"))==2 else val for val in f.split("\n")])
-    
-    elif dataset_type in ["protein_gym"]:
+    if dataset_type in ["protein_gym"]:
         seq_id_counter = 0
         for i in open(seq_file).readlines():
             # Skip header
@@ -127,8 +113,9 @@ def generate_tree(seq_file,
             labels_binary.append(int(data[3]))
             seq_id_counter += 1
         # Format for later RF calculation
-        f = open(tree_file, "r").read()
-        ref_tree_str = "".join([val.split("_")[1] if len(val.split("_"))==2 else val for val in f.split("\n")])
+        # f = open(tree_file, "r").read()
+        # ref_tree_str = "".join([val.split("_")[1] if len(val.split("_"))==2 else val for val in f.split("\n")])
+        ref_tree_str = None
     
     elif dataset_type in ["treebase"]:
         nucleotide_letters = {"A", "C", "G", "T", "N"}
@@ -217,7 +204,6 @@ def generate_tree(seq_file,
 
 
     if "Phyla" in model_name:
-
         with torch.no_grad():
             sequence_embeddings = model(batch['encoded_sequences'].to(device), 
                                         batch['sequence_mask'].to(device),
@@ -595,7 +581,7 @@ def tier2_metric(tree_dicts):
         labels_cont = tree_dicts[model_name]["labels_cont"]
         labels_binary = tree_dicts[model_name]["labels_binary"]
         threshold = tree_dicts[model_name]["max_dist"]
-        clusters = TreeCluster.run_treecluster(tree_str=pred_tree_str, threshold=threshold)
+        clusters = run_treecluster(pred_tree_str, threshold)
         # print("%s: %s" % (model_name, mean_cluster_value(names, clusters, labels_cont, labels_binary)))
         tier2_results[model_name] = mean_cluster_value(names, clusters, labels_cont, labels_binary)
     return tier2_results
@@ -893,6 +879,7 @@ def taxonomic_clustering_benchmark(models, output_file_name, output_file_locatio
                 nmi = normalized_mutual_info_score(labels, cluster_assignments)
 
                 output_file_path = "%s/%s" % (curr_dir, output_file_name)
+                os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
                 if not os.path.exists(output_file_path):
                     output_file = open(output_file_path, "w")
                     output_file.write("model,taxonomy,num,homogeneity,completeness,v_measure, nmi\n")
@@ -933,7 +920,7 @@ def functional_prediction_benchmark(models, num_datasets, output_file_name, eval
     tier2_spearmans = []
 
     # Iterate through all datasets
-    csv_dir_path = ""
+    csv_dir_path = "ProteinGym/"
     temp_tree_path = "" # TODO: Fix after generated all the original trees, now there's no need for reference trees since just doing tier2
     # file_names = file_names[:10]
     for dataset_name in tqdm(file_names, total=len(file_names)):
@@ -950,9 +937,6 @@ def functional_prediction_benchmark(models, num_datasets, output_file_name, eval
         # print("Generating results for %s" % dataset_name)
 
         try: 
-            # Keep track of entire runtime for each dataset
-            start_time_full = time.time()
-
             # Generate trees
             sequence_path = "%s/%s.csv" % (csv_dir_path, dataset_name)
             tree_dicts = {}
@@ -1012,6 +996,7 @@ def functional_prediction_benchmark(models, num_datasets, output_file_name, eval
             linearprobe_spearmans.append(tree_dicts[model_name]["corr_coeff_dict"]["spearman"])
             tier2_spearmans.append(tier2_dict[model_name]["spearman"])
             output_file_path = "%s/%s" % (curr_dir, output_file_name)
+            os.makedirs(os.path.dirname(output_file_path), exist_ok=True) 
             if not os.path.exists(output_file_path):
                 output_file = open(output_file_path, "w")
                 output_file.write("dataset,model,tier2_spearman,tier2_pearson,tier2_kendall,linear_probe_spearman,linear_probe_pearson,linear_probe_kendall,runtime,full_runtime\n")
@@ -1185,6 +1170,7 @@ def tree_reconstruction_benchmark(models, num_datasets, output_file_name, datase
                 normrfs.append(tier1_dict[model_id]["norm_rf"])
                 # Write results to output file
                 output_file_path = "%s/%s" % (curr_dir, output_file_name)
+                os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
                 if not os.path.exists(output_file_path):
                     output_file = open(output_file_path, "w")
                     output_file.write("dataset,model,rf,max_rf,norm_rf,runtime,full_runtime\n")
@@ -1246,17 +1232,23 @@ if __name__ == "__main__":
 
     # Generate Tier1 or Tier2 results
     if config.dataset.dataset == "protein_gym":
+        if 'ProteinGym' not in os.listdir():
+            os.system("wget https://tinyurl.com/mvudt6fd")
+            os.system("tar -xvf mvudt6fd")
+            os.system("rm mvudt6fd")
+
         last_dataset_id = 83
         output_file = "eval/eval_preds/protein_gym/protein_gym_results_%s.csv" % (config.trainer.model_type)
         num_datasets = [0, last_dataset_id]   # Start with the smallest 83 datasets for MAMBA's current 80GB GPU constraints
         eval_datasets = []
-        functional_prediction_benchmark(models, num_datasets, output_file, eval_datasets)
+        functional_prediction_benchmark(models, num_datasets, output_file, eval_datasets, device = config.eval.device)
     
     elif config.dataset.dataset == "treefam":
-        if 'yh78swxd' not in os.listdir():
+        if 'treefam.pickle' not in os.listdir():
             os.system("wget https://tinyurl.com/yh78swxd")
+            os.system("mv yh78swxd treefam.pickle")
 
-        data = pickle.load(open("yh78swxd", 'rb'))
+        data = pickle.load(open("treefam.pickle", 'rb'))
         num_datasets = [0, len(data)]
         last_dataset_id = len(data)
 
@@ -1265,9 +1257,10 @@ if __name__ == "__main__":
         tree_reconstruction_benchmark(models, num_datasets, output_file, config.dataset.dataset, dictionary_data=data, device = config.eval.device)
 
     elif config.dataset.dataset == "treebase":
-        if 'ke8pjyw7' not in os.listdir():
+        if 'treebase_benchmark' not in os.listdir():
             os.system("wget https://tinyurl.com/ke8pjyw7")
             os.system("unzip ke8pjyw7")
+            os.system("rm ke8pjyw7")
 
         last_dataset_id = 5822
         output_file = "eval/eval_preds/treebase/treebase_results_%s.csv" % (config.trainer.model_type)
@@ -1278,6 +1271,7 @@ if __name__ == "__main__":
         if '3rhyfu7t' not in os.listdir():
             os.system("wget https://tinyurl.com/3rhyfu7t")
             os.system("tar -xvf 3rhyfu7t")
+            os.system("rm 3rhyfu7t")
 
         last_dataset_id = 120
 

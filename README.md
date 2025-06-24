@@ -89,6 +89,24 @@ The **Tree Reasoning Benchmark** consists of two tasks across three datasets. It
 
 > Each replicate includes random groupings of 50 distinct labels, with 10 sequences per label. Use the taxonomic column in the `.tsv` and the sequence names to extract the clustering labels.
 
+## Task 3: Functional Prediction
+
+This task evaluates how well a model can predict functional impacts of protein variants using data from the **ProteinGym DMS Substitution Benchmark**. We use 83 datasets selected to fit within the memory limits of a single H100 GPU, with performance measured by **Spearman correlation**.
+
+**Benchmarking Approach:**
+
+- For all baseline protein language models, a **linear probe** is trained on the model embeddings to predict variant effects.
+- For **Phyla**, the process involves:
+  1. Constructing a phylogenetic tree from the protein sequences.
+  2. Injecting known functional labels into the corresponding tree leaves.
+  3. Using **TreeCluster** to cluster the tree into clades.
+  4. Assigning predicted labels to unlabeled leaves by averaging the known labels in their clade.
+
+This tree-based propagation strategy yields the best Spearman correlation for Phyla in functional prediction.
+
+> We use the [TreeCluster](https://github.com/niemasd/TreeCluster) toolkit to perform tree clustering.
+
+
 ---
 
 # Evaluation Instructions

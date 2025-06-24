@@ -21,9 +21,9 @@ checkpoint_id: 620
 } 
 
 dataset: {
-dataset: "GTB",
+#dataset: "GTB",
 #dataset: 'GTB'
-# dataset: "protein_gym"
+dataset: "protein_gym"
 }
 
 model: {
